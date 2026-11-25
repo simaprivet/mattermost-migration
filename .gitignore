@@ -1,0 +1,11 @@
+# Пароли — только в .env (локально) и в GitHub Secrets (пайплайн)
+.env
+legacy/.env
+
+# Бэкапы и временные файлы миграции (содержат данные и пароли)
+*.sql
+*.sql.gz
+*.tar.gz
+migration.load
+mysql.output
+pgloader.log

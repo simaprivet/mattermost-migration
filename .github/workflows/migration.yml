@@ -1,0 +1,287 @@
+name: Idempotent Mattermost Migration & Upgrade
+
+on:
+  push:
+    branches: [ "migration" ]
+  workflow_dispatch:
+
+# Два прогона одновременно не запускаются: второй ждёт окончания первого
+concurrency:
+  group: mattermost-migration
+  cancel-in-progress: false
+
+env:
+  COMPOSE_FILE: docker-compose.prod.yml
+  MIGRATION_ASSIST_IMAGE: mm-migration-assist:v0.8
+  PGLOADER_IMAGE: mattermost/mattermost-pgloader:latest
+
+defaults:
+  run:
+    shell: bash   # bash -eo pipefail: любая ошибка в любой команде роняет шаг
+
+jobs:
+  migrate-and-deploy:
+    runs-on: self-hosted
+    timeout-minutes: 40
+
+    # Пароли попадают в пайплайн ТОЛЬКО из GitHub Secrets.
+    # В скриптах они используются как переменные окружения, а не подставляются
+    # в текст команд, поэтому не видны ни в логе, ни в списке процессов.
+    # GitHub дополнительно маскирует значения секретов (***), если они где-то всплывут.
+    env:
+      DB_MYSQL_ROOT_PASSWORD: ${{ secrets.DB_MYSQL_ROOT_PASSWORD }}
+      DB_POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 0. Проверка окружения и секретов
+      - name: Pre-flight checks
+        run: |
+          for v in DB_MYSQL_ROOT_PASSWORD DB_POSTGRES_PASSWORD; do
+            if [ -z "${!v}" ]; then
+              echo "::error::GitHub Secret $v is not set (Settings → Secrets and variables → Actions)"
+              exit 1
+            fi
+          done
+          docker version --format 'Docker {{.Server.Version}}'
+          docker compose version
+          {
+            echo "MIGRATION_FLAG=$HOME/.mattermost_migration_completed"
+            echo "POSTS_COUNT_FILE=$HOME/.mattermost_mysql_posts_count"
+            echo "BACKUP_DIR=$HOME/mattermost_backups"
+            echo "WORK_DIR=$RUNNER_TEMP/mm-migration"
+          } >> "$GITHUB_ENV"
+
+      # 1. Проверка идемпотентности: выполнялась ли миграция ранее?
+      - name: Check Migration Status
+        id: check_status
+        run: |
+          if [ -f "$MIGRATION_FLAG" ]; then
+            echo "✅ Database already migrated to PostgreSQL. Skipping backup & data transfer."
+            echo "Flag file $MIGRATION_FLAG:"
+            cat "$MIGRATION_FLAG"
+            echo "already_migrated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "⚠️ Migration required (flag file $MIGRATION_FLAG not found)."
+            echo "already_migrated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 2. Резервная копия MySQL (и тома с файлами) перед началом работ
+      - name: Backup Legacy MySQL
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          if ! docker ps --format '{{.Names}}' | grep -qx "mattermost-mysql"; then
+            echo "❌ Error: Legacy MySQL container (mattermost-mysql) is not running!"
+            echo "   Start it first: cd legacy && docker compose up -d"
+            exit 1
+          fi
+
+          # Останавливаем старое приложение, чтобы в БД никто не писал во время переноса
+          if docker ps --format '{{.Names}}' | grep -qx "mattermost"; then
+            echo "⏸  Stopping legacy Mattermost 9.5 to freeze writes..."
+            docker stop mattermost
+          fi
+
+          mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
+          TS="$(date -u +%Y%m%dT%H%M%SZ)"
+          DUMP="$BACKUP_DIR/mattermost_mysql_backup_${GITHUB_RUN_ID}_${TS}.sql.gz"
+          export MYSQL_PWD="$DB_MYSQL_ROOT_PASSWORD"   # пароль передаётся через env, не через -p
+
+          echo "📦 Creating timestamped backup of MySQL..."
+          docker exec -e MYSQL_PWD mattermost-mysql \
+            mysqldump -uroot --single-transaction --routines --triggers \
+                      --set-gtid-purged=OFF --databases mattermost \
+            | gzip > "$DUMP"
+          gzip -t "$DUMP"
+          zcat "$DUMP" | tail -n 1 | grep -q "Dump completed" \
+            || { echo "❌ Backup is incomplete"; exit 1; }
+          echo "✅ MySQL backup saved: $DUMP ($(du -h "$DUMP" | cut -f1))"
+
+          echo "📦 Backing up mattermost_data volume (avatars, attachments)..."
+          docker run --rm -v mattermost_data:/data:ro -v "$BACKUP_DIR:/backup" alpine:3.20 \
+            sh -c "tar czf /backup/mattermost_data_${GITHUB_RUN_ID}_${TS}.tar.gz -C /data . \
+                   && chown $(id -u):$(id -g) /backup/mattermost_data_${GITHUB_RUN_ID}_${TS}.tar.gz"
+          echo "✅ Files backup saved: $BACKUP_DIR/mattermost_data_${GITHUB_RUN_ID}_${TS}.tar.gz"
+
+          echo "📊 Data in legacy MySQL:"
+          docker exec -e MYSQL_PWD mattermost-mysql mysql -uroot -t -e "
+            SELECT (SELECT COUNT(*) FROM mattermost.Users)    AS users,
+                   (SELECT COUNT(*) FROM mattermost.Teams)    AS teams,
+                   (SELECT COUNT(*) FROM mattermost.Channels) AS channels,
+                   (SELECT COUNT(*) FROM mattermost.Posts WHERE DeleteAt = 0) AS posts;"
+          docker exec -e MYSQL_PWD mattermost-mysql mysql -uroot -N -B \
+            -e "SELECT COUNT(*) FROM mattermost.Posts WHERE DeleteAt = 0;" > "$POSTS_COUNT_FILE"
+
+      # 3. Поднятие целевого PostgreSQL (только БД, приложение ещё не трогаем)
+      - name: Start Target PostgreSQL
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker compose -f "$COMPOSE_FILE" up -d --wait db-postgres
+          echo "✅ PostgreSQL is healthy"
+
+      # 4. Очистка целевой схемы — аналог pgloader "include drop".
+      #    Если прошлый запуск упал посередине переноса, таблицы удаляются и создаются
+      #    заново, а не дублируются. Шаг можно запускать сколько угодно раз.
+      - name: Reset target schema (include drop)
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker exec -i mattermost-postgres psql -v ON_ERROR_STOP=1 -U mmuser -d mattermost <<'SQL'
+          -- pgloader временно переименовывает public -> mattermost; убираем остатки упавшего прогона
+          DROP SCHEMA IF EXISTS mattermost CASCADE;
+          DROP SCHEMA IF EXISTS public CASCADE;
+          CREATE SCHEMA public AUTHORIZATION mmuser;
+          ALTER ROLE mmuser RESET search_path;
+          SQL
+          echo "✅ Target schema is clean"
+
+      # 5. Подготовка: образ migration-assist, исходная БД, схема PostgreSQL
+      - name: Prepare migration (migration-assist)
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker build -q -t "$MIGRATION_ASSIST_IMAGE" ./migration
+
+          rm -rf "$WORK_DIR" && mkdir -p "$WORK_DIR"
+          export MYSQL_DSN="root:${DB_MYSQL_ROOT_PASSWORD}@tcp(mattermost-mysql:3306)/mattermost"
+          export PG_DSN="postgres://mmuser:${DB_POSTGRES_PASSWORD}@mattermost-postgres:5432/mattermost?sslmode=disable"
+
+          # Утилита работает внутри той же изолированной bridge-сети, что и обе СУБД.
+          # DSN передаются через env (-e NAME без значения), а не аргументами команды.
+          # Переменные $MYSQL_DSN/$PG_DSN в одинарных кавычках ниже раскрываются
+          # ВНУТРИ контейнера — так задумано (поэтому SC2016 отключён).
+          ma() {
+            docker run --rm --network mattermost_network \
+              --user "$(id -u):$(id -g)" -v "$WORK_DIR:/work" -w /work \
+              -e MYSQL_DSN -e PG_DSN "$MIGRATION_ASSIST_IMAGE" sh -c "$1"
+          }
+
+          # pgloader не умеет caching_sha2_password (дефолт MySQL 8) — включаем native для root
+          export MYSQL_PWD="$DB_MYSQL_ROOT_PASSWORD"
+          docker exec -i -e MYSQL_PWD mattermost-mysql mysql -uroot <<SQL
+          ALTER USER 'root'@'%' IDENTIFIED WITH mysql_native_password BY '${DB_MYSQL_ROOT_PASSWORD}';
+          SQL
+
+          echo "🔎 [1/3] Checking & fixing MySQL schema..."
+          # shellcheck disable=SC2016
+          ma 'migration-assist mysql "$MYSQL_DSN" --fix-artifacts --fix-unicode --fix-varchar'
+
+          echo "🏗  [2/3] Creating PostgreSQL schema of the SAME version as source (9.5)..."
+          # shellcheck disable=SC2016
+          ma 'migration-assist postgres "$PG_DSN" --run-migrations --applied-migrations=mysql.output'
+
+          echo "📝 [3/3] Generating pgloader config..."
+          # shellcheck disable=SC2016
+          ma 'migration-assist pgloader --mysql="$MYSQL_DSN" --postgres="$PG_DSN" --remove-null-chars --output=migration.load'
+          # pgloader внутри своего контейнера должен иметь право прочитать файл
+          chmod 755 "$WORK_DIR" && chmod 644 "$WORK_DIR/migration.load"
+          echo "✅ Migration prepared"
+
+      # 6. Гетерогенная миграция данных MySQL -> PostgreSQL официальным образом pgloader
+      - name: Run pgloader
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          echo "🔄 Migrating data from MySQL to PostgreSQL..."
+          # ВАЖНО: официальный образ pgloader от Mattermost (без проблем со сборкой
+          # и аутентификацией MySQL). Образ только amd64 — на arm64 работает через эмуляцию.
+          docker run --rm --platform linux/amd64 --network mattermost_network \
+            -v "$WORK_DIR:/home/migration:ro" \
+            "$PGLOADER_IMAGE" pgloader /home/migration/migration.load \
+            2>&1 | tee "$WORK_DIR/pgloader.log"
+
+          if grep -Eq '(^|[[:space:]])(FATAL|ERROR)([[:space:]]|:)' "$WORK_DIR/pgloader.log"; then
+            echo "❌ pgloader reported errors (see log above)"
+            exit 1
+          fi
+
+          echo "🗂  Restoring full-text indexes..."
+          export PG_DSN="postgres://mmuser:${DB_POSTGRES_PASSWORD}@mattermost-postgres:5432/mattermost?sslmode=disable"
+          # shellcheck disable=SC2016
+          docker run --rm --network mattermost_network --user "$(id -u):$(id -g)" \
+            -e PG_DSN "$MIGRATION_ASSIST_IMAGE" \
+            sh -c 'migration-assist postgres post-migrate --create-indexes "$PG_DSN"'
+          echo "✅ Data transferred"
+
+      # 7. Маркерный флаг-файл успешной миграции
+      - name: Mark Migration as Completed
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          {
+            echo "migrated_at=$(date -u +%FT%TZ)"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "commit=$GITHUB_SHA"
+          } > "$MIGRATION_FLAG"
+          echo "🏁 Flag file created: $MIGRATION_FLAG"
+
+      # 8. Развертывание обновлённого стека (выполняется при КАЖДОМ запуске)
+      - name: Deploy Upgraded Stack
+        run: |
+          echo "🚀 Launching Upgraded Mattermost Stack..."
+          # --remove-orphans остановит и удалит старый контейнер mattermost-mysql
+          # (он принадлежит тому же compose-проекту "mattermost", но не описан в prod-файле)
+          docker compose -f "$COMPOSE_FILE" up -d --build --remove-orphans
+          docker compose -f "$COMPOSE_FILE" ps
+
+      # 9. Автоматическая проверка работоспособности и сохранности данных
+      - name: Run Health Checks & Verify Data
+        run: |
+          echo "🧪 Running Smoke Tests..."
+          echo "⏳ Waiting for Mattermost to apply internal database updates (up to 5 min)..."
+          CODE=000
+          for _ in $(seq 1 60); do
+            CODE="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8065/api/v4/system/ping || true)"
+            [ "$CODE" = "200" ] && break
+            sleep 5
+          done
+
+          if [ "$CODE" != "200" ]; then
+            echo "❌ Application health check failed (HTTP $CODE). Fetching logs..."
+            docker compose -f "$COMPOSE_FILE" logs --tail=200
+            exit 1
+          fi
+          echo "✅ API /api/v4/system/ping -> HTTP $CODE"
+          curl -sf "http://localhost:8065/api/v4/system/ping?get_server_status=true"; echo
+
+          UI_CODE="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8065/)"
+          [ "$UI_CODE" = "200" ] || { echo "❌ Web UI returned HTTP $UI_CODE"; exit 1; }
+          echo "✅ Web UI / -> HTTP $UI_CODE"
+
+          VERSION="$(curl -sI http://localhost:8065/api/v4/system/ping | awk -F': ' 'tolower($1)=="x-version-id"{print $2}' | tr -d '\r')"
+          echo "ℹ️  Server version: $VERSION"
+          [[ "$VERSION" == 12.0.1* ]] || { echo "❌ Expected Mattermost 12.0.1"; exit 1; }
+
+          DRIVER="$(docker inspect mattermost --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^MM_SQLSETTINGS_DRIVERNAME=' | cut -d= -f2)"
+          [ "$DRIVER" = "postgres" ] || { echo "❌ Mattermost is not using PostgreSQL"; exit 1; }
+          echo "✅ Mattermost is running on PostgreSQL"
+
+          if docker ps -a --format '{{.Names}}' | grep -qx "mattermost-mysql"; then
+            echo "❌ Legacy MySQL container still exists"; exit 1
+          fi
+          echo "✅ Legacy MySQL container removed"
+
+          PG_POSTS="$(docker exec mattermost-postgres psql -U mmuser -d mattermost -tAc \
+                      "SELECT COUNT(*) FROM posts WHERE deleteat = 0;")"
+          echo "📊 Posts in PostgreSQL: $PG_POSTS"
+          if [ -f "$POSTS_COUNT_FILE" ]; then
+            MY_POSTS="$(tr -d '[:space:]' < "$POSTS_COUNT_FILE")"
+            echo "📊 Posts in legacy MySQL before migration: $MY_POSTS"
+            [ "$PG_POSTS" -ge "$MY_POSTS" ] || { echo "❌ Messages were lost!"; exit 1; }
+            echo "✅ All messages preserved"
+          fi
+
+          echo "💬 Last user messages in the database:"
+          docker exec mattermost-postgres psql -U mmuser -d mattermost -c "
+            SELECT to_timestamp(p.createat / 1000)::timestamp(0) AS created,
+                   u.username, c.displayname AS channel, left(p.message, 60) AS message
+            FROM posts p
+            JOIN users u    ON u.id = p.userid
+            JOIN channels c ON c.id = p.channelid
+            WHERE p.type = '' AND p.deleteat = 0
+            ORDER BY p.createat DESC LIMIT 10;"
+
+          echo "✅ Mattermost upgraded successfully and running on Postgres!"
+
+      # Временные файлы содержат пароли в конфиге pgloader — удаляем всегда
+      - name: Cleanup temporary files
+        if: always()
+        run: rm -rf "${WORK_DIR:-$RUNNER_TEMP/mm-migration}"

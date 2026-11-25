@@ -1,0 +1,69 @@
+# docker-compose.prod.yml
+# Целевой (production) стек: Mattermost v12.0.1 + PostgreSQL 15
+#
+# Пароль берётся из переменной окружения DB_POSTGRES_PASSWORD
+# (в пайплайне — из GitHub Secrets, локально — из файла .env рядом с этим файлом).
+#
+# Имя проекта "mattermost" — то же, что в legacy/docker-compose.yml:
+#   * том mattermost_data общий для обеих версий;
+#   * --remove-orphans удаляет контейнер mattermost-mysql старого стека;
+#   * сервис "mattermost" пересоздаётся на новом образе, а не конфликтует по имени.
+name: mattermost
+
+services:
+  db-postgres:
+    image: postgres:15-alpine
+    container_name: mattermost-postgres
+    environment:
+      - POSTGRES_USER=mmuser
+      - POSTGRES_PASSWORD=${DB_POSTGRES_PASSWORD:?DB_POSTGRES_PASSWORD is not set}
+      - POSTGRES_DB=mattermost
+      - TZ=UTC
+    # Порт 5432 НЕ публикуется наружу: БД доступна только внутри bridge-сети
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - mattermost_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mmuser -d mattermost"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  mattermost:
+    image: mattermost/mattermost-team-edition:12.0.1
+    container_name: mattermost
+    ports:
+      - "8065:8065"
+    environment:
+      - MM_SQLSETTINGS_DRIVERNAME=postgres
+      - MM_SQLSETTINGS_DATASOURCE=postgres://mmuser:${DB_POSTGRES_PASSWORD:?DB_POSTGRES_PASSWORD is not set}@mattermost-postgres:5432/mattermost?sslmode=disable&connect_timeout=10
+      - MM_SERVICESETTINGS_SITEURL=http://localhost:8065
+      - MM_TEAMSETTINGS_ENABLEOPENSERVER=false
+      - TZ=UTC
+    volumes:
+      # ТОТ ЖЕ том, что и в legacy: аватары и вложения сохраняются.
+      # Образы 9.5 и 12.0.1 работают от одного UID (2000), поэтому
+      # ошибок Permission denied после обновления нет.
+      - mattermost_data:/mattermost/data
+      - mattermost_logs:/mattermost/logs
+    networks:
+      - mattermost_network
+    depends_on:
+      db-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  mattermost_network:
+    name: mattermost_network
+    driver: bridge
+
+volumes:
+  mattermost_data:
+    name: mattermost_data
+  mattermost_logs:
+    name: mattermost_logs
+  postgres_data:
+    name: mattermost_postgres_data

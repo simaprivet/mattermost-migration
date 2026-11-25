@@ -1,0 +1,76 @@
+# legacy/docker-compose.yml
+# Старый (legacy) стек: Mattermost v9.5 + MySQL 8.0
+#
+# Запуск (из папки legacy/):
+#   cp .env.example .env      # и впишите свои пароли
+#   docker compose up -d
+#
+# ВАЖНО: имя проекта "mattermost" совпадает с docker-compose.prod.yml.
+# Благодаря этому:
+#   * prod-стек переиспользует ТОТ ЖЕ том mattermost_data (аватары, вложения);
+#   * `docker compose -f docker-compose.prod.yml up --remove-orphans` видит
+#     контейнер mattermost-mysql как "сироту" своего проекта и удаляет его.
+name: mattermost
+
+services:
+  mattermost:
+    # В методичке указан образ mattermost/mattermost:9.5 — такого тега нет,
+    # официальный образ Team Edition называется mattermost-team-edition.
+    image: mattermost/mattermost-team-edition:9.5
+    container_name: mattermost
+    ports:
+      - "8065:8065"
+    environment:
+      # Драйвер для MySQL называется "mysql" (squirrel — это SQL-библиотека, не драйвер)
+      - MM_SQLSETTINGS_DRIVERNAME=mysql
+      - MM_SQLSETTINGS_DATASOURCE=mmuser:${DB_MYSQL_PASSWORD:?set DB_MYSQL_PASSWORD in legacy/.env}@tcp(mattermost-mysql:3306)/mattermost?charset=utf8mb4,utf8&writeTimeout=30s
+      - MM_SERVICESETTINGS_SITEURL=http://localhost:8065
+      - MM_TEAMSETTINGS_ENABLEOPENSERVER=false
+      - TZ=UTC
+    volumes:
+      # Общий том с пользовательскими файлами (аватары, вложения) —
+      # переиспользуется в docker-compose.prod.yml
+      - mattermost_data:/mattermost/data
+      - mattermost_logs:/mattermost/logs
+    networks:
+      - mattermost_network
+    depends_on:
+      mattermost-mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mattermost-mysql:
+    image: mysql:8.0
+    container_name: mattermost-mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=${DB_MYSQL_ROOT_PASSWORD:?set DB_MYSQL_ROOT_PASSWORD in legacy/.env}
+      - MYSQL_DATABASE=mattermost
+      - MYSQL_USER=mmuser
+      - MYSQL_PASSWORD=${DB_MYSQL_PASSWORD:?set DB_MYSQL_PASSWORD in legacy/.env}
+      - TZ=UTC
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_general_ci"]
+    # Порт 3306 НЕ публикуется наружу: БД доступна только внутри bridge-сети
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - mattermost_network
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+networks:
+  mattermost_network:
+    name: mattermost_network
+    driver: bridge
+
+volumes:
+  mattermost_data:
+    name: mattermost_data
+  mattermost_logs:
+    name: mattermost_logs
+  mysql_data:
+    name: mattermost_mysql_data
